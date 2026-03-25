@@ -1,0 +1,391 @@
+# =============================================================================
+# GitLab CI/CD Pipeline — Full-Stack Deploy
+# =============================================================================
+# MR to main  → validate + test + plan
+# Merge to main → validate + test + build + deploy (staging auto, prod manual)
+# =============================================================================
+
+stages:
+  - validate
+  - test
+  - build
+  - deploy
+  - notify
+
+variables:
+  AWS_REGION: eu-north-1
+  ECR_REPOSITORY: fullstack-deploy-api
+  TF_DIR: terraform
+  DOCKER_IMAGE: docker:26
+  PYTHON_IMAGE: python:3.12-alpine
+  TERRAFORM_VERSION: "1.7.0"
+
+# ─── Templates ───────────────────────────────────────────────────────────────
+
+.aws_auth: &aws_auth
+  before_script:
+    - apk add --no-cache aws-cli || pip install awscli -q 2>/dev/null || true
+    - aws configure set region $AWS_REGION
+    - aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
+    - aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
+
+# =============================================================================
+# Stage 1: VALIDATE
+# =============================================================================
+
+lint:
+  stage: validate
+  image: $PYTHON_IMAGE
+  script:
+    - pip install ruff -q
+    - ruff check app/
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+dockerfile-lint:
+  stage: validate
+  image: hadolint/hadolint:latest-alpine
+  script:
+    - hadolint app/Dockerfile
+  allow_failure: true
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+terraform-validate:
+  stage: validate
+  image:
+    name: hashicorp/terraform:$TERRAFORM_VERSION
+    entrypoint: [""]
+  script:
+    - cd $TF_DIR
+    - terraform fmt -check -recursive
+    - terraform init -backend=false
+    - terraform validate
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+tfsec:
+  stage: validate
+  image:
+    name: aquasec/tfsec:latest
+    entrypoint: [""]
+  script:
+    - tfsec $TF_DIR --soft-fail
+  allow_failure: true
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+# =============================================================================
+# Stage 2: TEST
+# =============================================================================
+
+test:
+  stage: test
+  image: $PYTHON_IMAGE
+  script:
+    - pip install -r app/requirements-dev.txt -q
+    - cd app
+    - pytest tests/ -v --cov=src --cov-report=xml --cov-report=term
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: app/coverage.xml
+    expire_in: 7 days
+  coverage: '/(?i)total.*? (100(?:\.0+)?\%|[1-9]?\d(?:\.\d+)?\%)$/'
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+docker-build:
+  stage: test
+  image: $DOCKER_IMAGE
+  services:
+    - docker:26-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  script:
+    - docker build -t test-build:ci ./app
+    - echo "Image built successfully"
+    - docker images test-build:ci --format "Size={{.Size}}"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+trivy-scan:
+  stage: test
+  image: $DOCKER_IMAGE
+  services:
+    - docker:26-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  script:
+    - docker build -t test-build:ci ./app
+    - docker run --rm
+        -v /var/run/docker.sock:/var/run/docker.sock
+        aquasec/trivy:latest image
+        --exit-code 1
+        --severity CRITICAL,HIGH
+        test-build:ci
+  allow_failure: true
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+# =============================================================================
+# Stage 2.5: TERRAFORM PLAN (MR only)
+# =============================================================================
+
+terraform-plan:
+  stage: test
+  image:
+    name: hashicorp/terraform:$TERRAFORM_VERSION
+    entrypoint: [""]
+  <<: *aws_auth
+  script:
+    - cd $TF_DIR
+    - terraform init
+    - terraform plan
+        -var-file=environments/prod/terraform.tfvars
+        -var="alert_email=$ALERT_EMAIL"
+        -no-color -out=tfplan 2>&1 | tee plan_output.txt
+    # Post plan as MR note
+    - |
+      if [ -n "$CI_MERGE_REQUEST_IID" ]; then
+        PLAN=$(cat plan_output.txt | head -c 60000)
+        BODY=$(printf '{"body":"### Terraform Plan 📋\n<details><summary>Show plan</summary>\n\n```\n%s\n```\n</details>"}' "$PLAN")
+        curl --silent --request POST \
+          --header "PRIVATE-TOKEN: $GITLAB_API_TOKEN" \
+          --header "Content-Type: application/json" \
+          --data "$BODY" \
+          "$CI_API_V4_URL/projects/$CI_PROJECT_ID/merge_requests/$CI_MERGE_REQUEST_IID/notes" || true
+      fi
+  artifacts:
+    paths:
+      - $TF_DIR/plan_output.txt
+    expire_in: 7 days
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+# =============================================================================
+# Stage 3: BUILD & PUSH TO ECR (main only)
+# =============================================================================
+
+build-push-ecr:
+  stage: build
+  image: $DOCKER_IMAGE
+  services:
+    - docker:26-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  before_script:
+    - apk add --no-cache aws-cli
+    - aws configure set region $AWS_REGION
+    - aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
+    - aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
+  script:
+    - IMAGE_TAG="$CI_COMMIT_SHORT_SHA"
+    - REGISTRY=$(aws ecr describe-repositories
+        --repository-names $ECR_REPOSITORY
+        --query "repositories[0].repositoryUri"
+        --output text | sed 's|/.*||')
+
+    # Login to ECR
+    - aws ecr get-login-password --region $AWS_REGION
+        | docker login --username AWS --password-stdin "$REGISTRY"
+
+    - FULL_URI="$REGISTRY/$ECR_REPOSITORY"
+
+    # Build
+    - docker build
+        -t "$FULL_URI:$IMAGE_TAG"
+        -t "$FULL_URI:latest"
+        -t "$FULL_URI:$CI_COMMIT_REF_SLUG"
+        --build-arg APP_VERSION="$IMAGE_TAG"
+        ./app
+
+    # Push
+    - docker push "$FULL_URI:$IMAGE_TAG"
+    - docker push "$FULL_URI:latest"
+    - docker push "$FULL_URI:$CI_COMMIT_REF_SLUG"
+
+    - echo "IMAGE_TAG=$IMAGE_TAG" >> build.env
+    - echo "FULL_URI=$FULL_URI" >> build.env
+  artifacts:
+    reports:
+      dotenv: build.env
+    expire_in: 1 day
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+# =============================================================================
+# Stage 4: DEPLOY
+# =============================================================================
+
+# ── Terraform Apply (staging — auto) ─────────────────────────────────────────
+
+terraform-apply-staging:
+  stage: deploy
+  image:
+    name: hashicorp/terraform:$TERRAFORM_VERSION
+    entrypoint: [""]
+  <<: *aws_auth
+  script:
+    - cd $TF_DIR
+    - terraform init
+    - terraform apply -auto-approve
+        -var-file=environments/staging/terraform.tfvars
+        -var="alert_email=$ALERT_EMAIL"
+        -var="slack_webhook_url=$SLACK_WEBHOOK_URL"
+  environment:
+    name: staging
+    url: http://$STAGING_ALB_DNS
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+# ── Deploy App to Staging (auto) ─────────────────────────────────────────────
+
+deploy-staging:
+  stage: deploy
+  image: alpine:latest
+  needs:
+    - job: build-push-ecr
+      artifacts: true
+    - job: terraform-apply-staging
+  <<: *aws_auth
+  script:
+    - echo "Deploying $IMAGE_TAG to staging..."
+
+    # Find staging ASG
+    - ASG_NAME=$(aws autoscaling describe-auto-scaling-groups
+        --query "AutoScalingGroups[?contains(Tags[?Key=='Name'].Value | [0], 'fullstack-deploy') && contains(Tags[?Key=='Environment'].Value | [0], 'staging')].AutoScalingGroupName | [0]"
+        --output text)
+
+    - echo "ASG $ASG_NAME — triggering instance refresh"
+    - aws autoscaling start-instance-refresh
+        --auto-scaling-group-name "$ASG_NAME"
+        --preferences '{"MinHealthyPercentage":50,"InstanceWarmup":120}'
+
+    # Wait for healthy targets
+    - TG_ARN=$(aws elbv2 describe-target-groups
+        --query "TargetGroups[?contains(TargetGroupName, 'app')].TargetGroupArn | [0]"
+        --output text)
+    - |
+      for i in $(seq 1 20); do
+        HEALTHY=$(aws elbv2 describe-target-health \
+          --target-group-arn "$TG_ARN" \
+          --query "TargetHealthDescriptions[?TargetHealth.State=='healthy'] | length(@)" \
+          --output text)
+        echo "Healthy targets: $HEALTHY (attempt $i/20)"
+        [ "$HEALTHY" -ge 1 ] && echo "Staging deploy OK!" && exit 0
+        sleep 15
+      done
+      echo "Timeout waiting for healthy targets" && exit 1
+  environment:
+    name: staging
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+# ── Terraform Apply (production — manual) ─────────────────────────────────────
+
+terraform-apply-prod:
+  stage: deploy
+  image:
+    name: hashicorp/terraform:$TERRAFORM_VERSION
+    entrypoint: [""]
+  <<: *aws_auth
+  script:
+    - cd $TF_DIR
+    - terraform init
+    - terraform apply -auto-approve
+        -var-file=environments/prod/terraform.tfvars
+        -var="alert_email=$ALERT_EMAIL"
+        -var="slack_webhook_url=$SLACK_WEBHOOK_URL"
+  environment:
+    name: production
+    url: http://$PROD_ALB_DNS
+  needs:
+    - job: deploy-staging
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+
+# ── Deploy App to Production (manual) ────────────────────────────────────────
+
+deploy-prod:
+  stage: deploy
+  image: alpine:latest
+  needs:
+    - job: build-push-ecr
+      artifacts: true
+    - job: terraform-apply-prod
+  <<: *aws_auth
+  script:
+    - echo "Deploying $IMAGE_TAG to production..."
+
+    - ASG_NAME=$(aws autoscaling describe-auto-scaling-groups
+        --query "AutoScalingGroups[?contains(Tags[?Key=='Name'].Value | [0], 'fullstack-deploy') && contains(Tags[?Key=='Environment'].Value | [0], 'prod')].AutoScalingGroupName | [0]"
+        --output text)
+
+    - echo "ASG $ASG_NAME — triggering instance refresh"
+    - aws autoscaling start-instance-refresh
+        --auto-scaling-group-name "$ASG_NAME"
+        --preferences '{"MinHealthyPercentage":50,"InstanceWarmup":120}'
+
+    - TG_ARN=$(aws elbv2 describe-target-groups
+        --query "TargetGroups[?contains(TargetGroupName, 'app')].TargetGroupArn | [0]"
+        --output text)
+    - |
+      for i in $(seq 1 20); do
+        HEALTHY=$(aws elbv2 describe-target-health \
+          --target-group-arn "$TG_ARN" \
+          --query "TargetHealthDescriptions[?TargetHealth.State=='healthy'] | length(@)" \
+          --output text)
+        echo "Healthy targets: $HEALTHY (attempt $i/20)"
+        [ "$HEALTHY" -ge 1 ] && echo "Production deploy OK!" && exit 0
+        sleep 15
+      done
+      echo "Timeout waiting for healthy targets" && exit 1
+  environment:
+    name: production
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+
+# =============================================================================
+# Stage 5: NOTIFY
+# =============================================================================
+
+notify-success:
+  stage: notify
+  image: alpine:latest
+  <<: *aws_auth
+  script:
+    - |
+      aws sns publish \
+        --topic-arn "$SNS_TOPIC_ARN" \
+        --subject "Deploy SUCCESS" \
+        --message "Deployment succeeded for commit ${CI_COMMIT_SHORT_SHA} in ${CI_PROJECT_PATH} (pipeline #${CI_PIPELINE_ID})" \
+        --region $AWS_REGION || true
+    - echo "Deployment notification sent"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: on_success
+
+notify-failure:
+  stage: notify
+  image: alpine:latest
+  <<: *aws_auth
+  script:
+    - |
+      aws sns publish \
+        --topic-arn "$SNS_TOPIC_ARN" \
+        --subject "Deploy FAILED" \
+        --message "Deployment FAILED for commit ${CI_COMMIT_SHORT_SHA} in ${CI_PROJECT_PATH} (pipeline #${CI_PIPELINE_ID})" \
+        --region $AWS_REGION || true
+    - echo "Failure notification sent"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: on_failure
