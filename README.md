@@ -1,24 +1,24 @@
 # Full-Stack Deploy: Terraform + GitLab CI/CD + Monitoring
 
-> Полная автоматизация от коммита до production на AWS с мониторингом и алертами.
+> Complete automation from commit to production on AWS with monitoring and alerting.
 
-Этот проект демонстрирует **end-to-end DevOps-пайплайн**: инфраструктура разворачивается через Terraform, код доставляется через GitLab CI/CD, а Prometheus + Grafana + AlertManager следят за здоровьем системы 24/7.
-
----
-
-## Что делает этот проект
-
-1. **Ты пушишь код** → GitLab автоматически прогоняет тесты, линтеры и сканеры безопасности
-2. **Создаёшь Merge Request** → GitLab показывает `terraform plan` прямо в комментарии — какие ресурсы изменятся
-3. **Мержишь в main** → собирается Docker-образ, пушится в ECR, Terraform обновляет инфраструктуру, приложение катится на staging автоматически
-4. **Нажимаешь кнопку** → деплой на production (ручной триггер — защита от случайного выката)
-5. **Мониторинг** → Grafana-дашборды показывают latency, error rate, CPU/memory. Если что-то сломалось — алерт на почту и в Slack
-
-**Ноль ручных действий** между коммитом и production (кроме финального подтверждения).
+This project demonstrates an **end-to-end DevOps pipeline**: infrastructure is provisioned via Terraform, code is delivered through GitLab CI/CD, and Prometheus + Grafana + AlertManager monitor system health 24/7.
 
 ---
 
-## Архитектура
+## What This Project Does
+
+1. **You push code** → GitLab automatically runs tests, linters, and security scanners
+2. **You create a Merge Request** → GitLab posts `terraform plan` as an MR comment — showing exactly what AWS resources will change
+3. **You merge to main** → Docker image is built, pushed to ECR, Terraform updates infrastructure, app rolls out to staging automatically
+4. **You click a button** → production deployment (manual trigger — protection against accidental rollouts)
+5. **Monitoring** → Grafana dashboards show latency, error rate, CPU/memory. If something breaks — alert via email and Slack
+
+**Zero manual steps** between commit and production (except the final confirmation).
+
+---
+
+## Architecture
 
 ```
                     ┌───────────────────────────────────────────────────┐
@@ -54,65 +54,65 @@
                     └───────────────────────────────────────────────────┘
 ```
 
-### Как трафик проходит через систему
+### Traffic Flow
 
 ```
-Пользователь → ALB (порт 80) → EC2 инстанс (порт 8000) → RDS PostgreSQL (порт 5432)
+User → ALB (port 80) → EC2 instance (port 8000) → RDS PostgreSQL (port 5432)
 ```
 
-- **ALB** принимает HTTP-запросы из интернета и распределяет их между EC2 инстансами
-- **EC2 инстансы** находятся в приватной подсети — к ним нельзя подключиться напрямую из интернета
-- **RDS** тоже в приватной подсети — доступ только от EC2 инстансов приложения
-- **NAT Gateway** позволяет приватным инстансам выходить в интернет (для обновлений и скачивания Docker-образов)
+- **ALB** accepts HTTP requests from the internet and distributes them across EC2 instances
+- **EC2 instances** reside in private subnets — no direct internet access
+- **RDS** is also in a private subnet — only accessible from app EC2 instances
+- **NAT Gateway** allows private instances to reach the internet (for updates and pulling Docker images)
 
-### Безопасность (Security Groups)
+### Security (Security Groups)
 
 ```
-ALB SG:  принимает HTTP/HTTPS от 0.0.0.0/0 (весь интернет)
+ALB SG:  accepts HTTP/HTTPS from 0.0.0.0/0 (entire internet)
      ↓
-App SG:  принимает порт 8000 ТОЛЬКО от ALB SG
+App SG:  accepts port 8000 ONLY from ALB SG
      ↓
-RDS SG:  принимает порт 5432 ТОЛЬКО от App SG
+RDS SG:  accepts port 5432 ONLY from App SG
 ```
 
-Каждый уровень доступен только с предыдущего. Базу данных невозможно достать из интернета.
+Each layer is only accessible from the previous one. The database cannot be reached from the internet.
 
 ---
 
 ## CI/CD Pipeline (GitLab)
 
-### При создании Merge Request
+### On Merge Request
 
-GitLab запускает проверки **до того, как код попадёт в main**:
+GitLab runs checks **before code reaches main**:
 
-| Job | Что делает | Зачем |
-|-----|-----------|-------|
-| `lint` | Проверка кода линтером ruff | Единый стиль кода |
-| `dockerfile-lint` | Проверка Dockerfile (hadolint) | Best practices в Docker |
-| `terraform-validate` | `terraform fmt` + `validate` | Корректность Terraform-кода |
-| `tfsec` | Сканирование Terraform на уязвимости | Безопасность инфраструктуры |
-| `test` | Pytest + coverage report | Код работает, покрытие видно в MR |
-| `docker-build` | Сборка Docker-образа | Dockerfile собирается без ошибок |
-| `trivy-scan` | Сканирование образа на CVE | Нет критических уязвимостей |
-| `terraform-plan` | Plan + комментарий в MR | Видно, что изменится в AWS |
+| Job | What it does | Why |
+|-----|-------------|-----|
+| `lint` | Code check with ruff linter | Consistent code style |
+| `dockerfile-lint` | Dockerfile check (hadolint) | Docker best practices |
+| `terraform-validate` | `terraform fmt` + `validate` | Terraform code correctness |
+| `tfsec` | Terraform security scan | Infrastructure security |
+| `test` | Pytest + coverage report | Code works, coverage visible in MR |
+| `docker-build` | Build Docker image | Dockerfile compiles without errors |
+| `trivy-scan` | Container image CVE scan | No critical vulnerabilities |
+| `terraform-plan` | Plan + comment in MR | See what will change in AWS |
 
-### При мерже в main
+### On Merge to Main
 
 ```
 test → build-push-ecr → terraform-apply-staging → deploy-staging → [terraform-apply-prod] → [deploy-prod] → notify
                                                                     └── manual trigger ──┘
 ```
 
-| Job | Что делает | Автоматически? |
-|-----|-----------|---------------|
-| `build-push-ecr` | Собирает Docker-образ, пушит в ECR (теги: SHA, latest, branch) | Да |
-| `terraform-apply-staging` | Применяет Terraform для staging-окружения | Да |
-| `deploy-staging` | Катит новую версию на staging через ASG instance refresh | Да |
-| `terraform-apply-prod` | Применяет Terraform для production | **Нет — кнопка** |
-| `deploy-prod` | Катит на production | **Нет — кнопка** |
-| `notify-success/failure` | Шлёт уведомление в SNS | Да |
+| Job | What it does | Automatic? |
+|-----|-------------|------------|
+| `build-push-ecr` | Build Docker image, push to ECR (tags: SHA, latest, branch) | Yes |
+| `terraform-apply-staging` | Apply Terraform for staging environment | Yes |
+| `deploy-staging` | Roll out new version to staging via ASG instance refresh | Yes |
+| `terraform-apply-prod` | Apply Terraform for production | **No — manual button** |
+| `deploy-prod` | Roll out to production | **No — manual button** |
+| `notify-success/failure` | Send notification via SNS | Yes |
 
-### Визуально
+### Pipeline Visualization
 
 ```
 ┌──────────┐   ┌──────┐   ┌───────┐   ┌─────────────────────┐   ┌────────┐
@@ -127,60 +127,60 @@ test → build-push-ecr → terraform-apply-staging → deploy-staging → [terr
 
 ---
 
-## Приложение
+## Application
 
-REST API на **FastAPI** (Python 3.12) с CRUD-операциями и встроенными Prometheus-метриками.
+REST API built with **FastAPI** (Python 3.12) featuring CRUD operations and built-in Prometheus metrics.
 
-### Эндпоинты
+### Endpoints
 
-| Метод | URL | Описание |
-|-------|-----|----------|
-| GET | `/` | Информация о сервисе (версия, окружение) |
-| GET | `/health` | Liveness probe — всегда 200, если процесс жив |
-| GET | `/ready` | Readiness probe — проверяет подключение к БД |
-| GET | `/api/items` | Список всех записей |
-| POST | `/api/items` | Создать запись `{"name": "...", "description": "..."}` |
-| GET | `/api/items/{id}` | Получить запись по ID |
-| DELETE | `/api/items/{id}` | Удалить запись |
-| GET | `/metrics` | Prometheus-метрики |
+| Method | URL | Description |
+|--------|-----|-------------|
+| GET | `/` | Service info (version, environment) |
+| GET | `/health` | Liveness probe — always returns 200 if the process is alive |
+| GET | `/ready` | Readiness probe — checks database connectivity |
+| GET | `/api/items` | List all records |
+| POST | `/api/items` | Create a record `{"name": "...", "description": "..."}` |
+| GET | `/api/items/{id}` | Get record by ID |
+| DELETE | `/api/items/{id}` | Delete record |
+| GET | `/metrics` | Prometheus metrics |
 
-### Метрики, которые собирает приложение
+### Metrics Collected by the Application
 
-| Метрика | Тип | Что измеряет |
-|---------|-----|-------------|
-| `http_requests_total` | Counter | Общее количество запросов (по методу, эндпоинту, статус-коду) |
-| `http_request_duration_seconds` | Histogram | Время ответа (p50, p95, p99) |
-| `http_active_requests` | Gauge | Сколько запросов обрабатывается прямо сейчас |
-| `db_connection_errors_total` | Counter | Ошибки подключения к БД |
-| `app_info` | Gauge | Версия и окружение приложения |
+| Metric | Type | What it measures |
+|--------|------|-----------------|
+| `http_requests_total` | Counter | Total requests (by method, endpoint, status code) |
+| `http_request_duration_seconds` | Histogram | Response time (p50, p95, p99) |
+| `http_active_requests` | Gauge | Requests being processed right now |
+| `db_connection_errors_total` | Counter | Database connection errors |
+| `app_info` | Gauge | Application version and environment |
 
-### Docker-образ
+### Docker Image
 
-- **Multi-stage build** — сборочные зависимости не попадают в финальный образ
-- **Non-root user** — контейнер запускается от `appuser`, а не от root
-- **HEALTHCHECK** — Docker сам проверяет, жив ли контейнер
-- Базовый образ: `python:3.12-slim`
+- **Multi-stage build** — build dependencies don't end up in the final image
+- **Non-root user** — container runs as `appuser`, not root
+- **HEALTHCHECK** — Docker monitors container health automatically
+- Base image: `python:3.12-slim`
 
 ---
 
-## Terraform — инфраструктура как код
+## Terraform — Infrastructure as Code
 
-Вся AWS-инфраструктура описана в **8 модулях**. Каждый модуль отвечает за свой слой:
+All AWS infrastructure is defined in **8 modules**. Each module handles its own layer:
 
-### Модули
+### Modules
 
-| Модуль | Что создаёт | Ключевые ресурсы |
-|--------|-----------|-----------------|
-| **vpc** | Сеть | VPC, 6 подсетей (2 public + 2 app + 2 db), Internet Gateway, NAT Gateway, Route Tables |
-| **ec2** | Вычисления | Launch Template, Auto Scaling Group (min 1 / max 4), IAM Role (ECR pull + Secrets Manager + CloudWatch) |
-| **rds** | База данных | PostgreSQL 16, Secrets Manager (пароль), DB Subnet Group, 7-дневные бэкапы |
-| **ecr** | Реестр образов | ECR Repository, Lifecycle Policy (хранит 10 последних образов) |
-| **alb** | Балансировщик | ALB, Target Group, HTTP Listener, Health Check (/health) |
-| **monitoring** | Мониторинг | EC2 инстанс с Docker Compose (Prometheus + Grafana + AlertManager + node-exporter) |
-| **cloudwatch** | Логи и алармы | Log Group, 6 метрик-алармов (ALB 5xx, ALB latency, ASG CPU, RDS CPU, RDS connections, RDS storage) |
-| **sns** | Уведомления | SNS Topic, Email-подписка, Lambda для Slack |
+| Module | What it creates | Key resources |
+|--------|----------------|--------------|
+| **vpc** | Networking | VPC, 6 subnets (2 public + 2 app + 2 db), Internet Gateway, NAT Gateway, Route Tables |
+| **ec2** | Compute | Launch Template, Auto Scaling Group (min 1 / max 4), IAM Role (ECR pull + Secrets Manager + CloudWatch) |
+| **rds** | Database | PostgreSQL 16, Secrets Manager (password), DB Subnet Group, 7-day backups |
+| **ecr** | Image registry | ECR Repository, Lifecycle Policy (keeps last 10 images) |
+| **alb** | Load balancer | ALB, Target Group, HTTP Listener, Health Check (/health) |
+| **monitoring** | Monitoring | EC2 instance with Docker Compose (Prometheus + Grafana + AlertManager + node-exporter) |
+| **cloudwatch** | Logs & alarms | Log Group, 6 metric alarms (ALB 5xx, ALB latency, ASG CPU, RDS CPU, RDS connections, RDS storage) |
+| **sns** | Notifications | SNS Topic, email subscription, Lambda for Slack |
 
-### Окружения
+### Environments
 
 ```
 terraform/environments/
@@ -190,16 +190,16 @@ terraform/environments/
 
 ### Terraform State
 
-- Хранится в **S3** (зашифрован, версионирован)
-- Блокировка через **DynamoDB** — два человека не смогут применить `terraform apply` одновременно
+- Stored in **S3** (encrypted, versioned)
+- Locking via **DynamoDB** — two people cannot run `terraform apply` simultaneously
 
 ---
 
-## Мониторинг и алерты
+## Monitoring & Alerting
 
-### Стек мониторинга
+### Monitoring Stack
 
-На отдельном EC2 инстансе крутятся 4 контейнера:
+A dedicated EC2 instance runs 4 containers:
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -217,265 +217,265 @@ terraform/environments/
 │  └──────────────┘  └──────────────┘                 │
 │                                                      │
 │  ┌──────────────┐                                    │
-│  │node-exporter │  Собирает CPU, RAM, disk           │
-│  │  :9100       │  с самого хоста                    │
+│  │node-exporter │  Collects CPU, RAM, disk           │
+│  │  :9100       │  from the host itself              │
 │  └──────────────┘                                    │
 └─────────────────────────────────────────────────────┘
 ```
 
-**Prometheus** каждые 15 секунд опрашивает:
-- Все EC2-инстансы приложения (auto-discovery по тегу `Name`) — метрики приложения
-- node-exporter на каждом инстансе — метрики системы (CPU, RAM, диск, сеть)
+**Prometheus** scrapes every 15 seconds:
+- All app EC2 instances (auto-discovery by `Name` tag) — application metrics
+- node-exporter on each instance — system metrics (CPU, RAM, disk, network)
 
-### Grafana Dashboards (экспортированные JSON)
+### Grafana Dashboards (exported JSON)
 
-**Application Overview** — здоровье приложения:
-- Request Rate (запросы/сек по эндпоинтам)
-- Error Rate (% ошибок 4xx и 5xx)
-- Latency p50 / p95 / p99 (время ответа)
-- Active Requests (запросы в обработке прямо сейчас)
-- DB Connection Errors (ошибки подключения к БД)
-- Requests by Status Code (круговая диаграмма)
+**Application Overview** — application health:
+- Request Rate (req/s by endpoint)
+- Error Rate (% of 4xx and 5xx errors)
+- Latency p50 / p95 / p99 (response time)
+- Active Requests (requests being processed right now)
+- DB Connection Errors
+- Requests by Status Code (pie chart)
 
-**System Metrics** — здоровье серверов:
-- CPU Usage % (по каждому инстансу)
-- Memory Usage % (по каждому инстансу)
+**System Metrics** — server health:
+- CPU Usage % (per instance)
+- Memory Usage % (per instance)
 - Disk Usage % (gauge)
-- Network I/O (входящий/исходящий трафик)
+- Network I/O (inbound/outbound traffic)
 - System Load (1m / 5m / 15m)
 - Open File Descriptors
 
-### Алерты
+### Alerts
 
-Двойная система алертинга — Prometheus + CloudWatch:
+Dual alerting system — Prometheus + CloudWatch:
 
 **Prometheus → AlertManager:**
 
-| Алерт | Порог | Severity |
-|-------|-------|----------|
-| High Error Rate | 5xx > 5% за 2 мин | Critical |
-| High Latency p95 | > 1 сек за 3 мин | Warning |
-| High Latency p99 | > 2.5 сек за 3 мин | Critical |
-| Instance Down | up == 0 за 1 мин | Critical |
-| High CPU | > 80% за 5 мин | Warning |
-| High Memory | > 85% за 5 мин | Warning |
-| Disk Space Low | > 85% за 5 мин | Warning |
+| Alert | Threshold | Severity |
+|-------|-----------|----------|
+| High Error Rate | 5xx > 5% for 2 min | Critical |
+| High Latency p95 | > 1s for 3 min | Warning |
+| High Latency p99 | > 2.5s for 3 min | Critical |
+| Instance Down | up == 0 for 1 min | Critical |
+| High CPU | > 80% for 5 min | Warning |
+| High Memory | > 85% for 5 min | Warning |
+| Disk Space Low | > 85% for 5 min | Warning |
 
 **CloudWatch → SNS → Email/Slack:**
 
-| Алерт | Порог |
-|-------|-------|
-| ALB 5xx Count | > 10 за 5 мин |
-| ALB Latency p95 | > 2 сек за 15 мин |
-| ASG CPU | > 80% за 15 мин |
-| RDS CPU | > 80% за 15 мин |
+| Alert | Threshold |
+|-------|-----------|
+| ALB 5xx Count | > 10 in 5 min |
+| ALB Latency p95 | > 2s for 15 min |
+| ASG CPU | > 80% for 15 min |
+| RDS CPU | > 80% for 15 min |
 | RDS Connections | > 80 |
 | RDS Free Storage | < 2 GB |
 
 ---
 
-## Структура проекта
+## Project Structure
 
 ```
 .
-├── .gitlab-ci.yml                  # GitLab CI/CD: 5 стадий, 13 джобов
+├── .gitlab-ci.yml                  # GitLab CI/CD: 5 stages, 13 jobs
 │
-├── app/                            # Приложение
-│   ├── src/main.py                 #   FastAPI + Prometheus-метрики (220 строк)
-│   ├── tests/test_main.py          #   10 unit-тестов (pytest)
+├── app/                            # Application
+│   ├── src/main.py                 #   FastAPI + Prometheus metrics (220 lines)
+│   ├── tests/test_main.py          #   10 unit tests (pytest)
 │   ├── Dockerfile                  #   Multi-stage, non-root, HEALTHCHECK
 │   ├── requirements.txt            #   fastapi, uvicorn, psycopg2, prometheus-client
 │   └── requirements-dev.txt        #   pytest, httpx, coverage
 │
-├── terraform/                      # Инфраструктура (Terraform)
-│   ├── main.tf                     #   Корневой модуль + Security Groups
-│   ├── variables.tf                #   Все переменные
-│   ├── outputs.tf                  #   VPC ID, ALB DNS, Grafana URL и т.д.
+├── terraform/                      # Infrastructure (Terraform)
+│   ├── main.tf                     #   Root module + Security Groups
+│   ├── variables.tf                #   All variables
+│   ├── outputs.tf                  #   VPC ID, ALB DNS, Grafana URL, etc.
 │   ├── providers.tf                #   AWS provider + default tags
 │   ├── backend.tf                  #   S3 remote state + DynamoDB lock
 │   ├── modules/
-│   │   ├── vpc/                    #   Сеть (VPC, подсети, NAT, IGW)
+│   │   ├── vpc/                    #   Networking (VPC, subnets, NAT, IGW)
 │   │   ├── ec2/                    #   Compute (ASG, Launch Template, IAM, user_data)
-│   │   ├── rds/                    #   БД (PostgreSQL, Secrets Manager)
-│   │   ├── ecr/                    #   Docker-реестр (lifecycle policy)
-│   │   ├── alb/                    #   Балансировщик (Target Group, Listener)
-│   │   ├── monitoring/             #   Мониторинг-сервер (Docker Compose внутри)
-│   │   ├── cloudwatch/             #   Логи + 6 алармов
+│   │   ├── rds/                    #   Database (PostgreSQL, Secrets Manager)
+│   │   ├── ecr/                    #   Docker registry (lifecycle policy)
+│   │   ├── alb/                    #   Load balancer (Target Group, Listener)
+│   │   ├── monitoring/             #   Monitoring server (Docker Compose inside)
+│   │   ├── cloudwatch/             #   Logs + 6 alarms
 │   │   └── sns/                    #   Email + Slack Lambda
 │   └── environments/
 │       ├── staging/terraform.tfvars
 │       └── prod/terraform.tfvars
 │
-├── monitoring/                     # Конфиги мониторинга
+├── monitoring/                     # Monitoring configs
 │   ├── prometheus/
-│   │   ├── prometheus.yml          #   Scrape-конфиг (app + node-exporter)
+│   │   ├── prometheus.yml          #   Scrape config (app + node-exporter)
 │   │   └── alerts.yml              #   7 alert rules
 │   ├── grafana/
 │   │   ├── dashboards/
-│   │   │   ├── app-overview.json   #   Дашборд приложения (7 панелей)
-│   │   │   └── system-metrics.json #   Дашборд системы (7 панелей)
+│   │   │   ├── app-overview.json   #   Application dashboard (7 panels)
+│   │   │   └── system-metrics.json #   System dashboard (7 panels)
 │   │   └── provisioning/           #   Auto-provisioning datasource + dashboards
 │   └── alertmanager/
 │       └── alertmanager.yml        #   Routing rules
 │
-├── scripts/                        # Операционные скрипты
-│   ├── deploy.sh                   #   Rolling deploy через ASG instance refresh
-│   ├── rollback.sh                 #   Откат к предыдущей версии Launch Template
-│   ├── health-check.sh             #   Проверка всех компонентов (ALB, TG, RDS, CW)
-│   └── setup-monitoring.sh         #   Загрузка конфигов на мониторинг-сервер
+├── scripts/                        # Operational scripts
+│   ├── deploy.sh                   #   Rolling deploy via ASG instance refresh
+│   ├── rollback.sh                 #   Rollback to previous Launch Template version
+│   ├── health-check.sh             #   Check all components (ALB, TG, RDS, CW)
+│   └── setup-monitoring.sh         #   Upload configs to monitoring server
 │
-├── docs/                           # Документация
-│   ├── runbook.md                  #   Инструкции по эксплуатации (деплой, откат, инциденты)
-│   ├── cost-breakdown.md           #   Разбивка стоимости по ресурсам
+├── docs/                           # Documentation
+│   ├── runbook.md                  #   Operations guide: deploy, rollback, incidents
+│   ├── cost-breakdown.md           #   AWS resource cost breakdown
 │   └── adr/                        #   Architecture Decision Records
-│       ├── 001-gitlab-cicd.md      #     Почему GitLab CI, а не Jenkins/GitHub Actions
-│       ├── 002-monitoring-stack.md #     Почему Prometheus+Grafana, а не только CloudWatch
-│       └── 003-vpc-network-design.md #   Почему 3-tier VPC с двумя AZ
+│       ├── 001-gitlab-cicd.md      #     Why GitLab CI over Jenkins/GitHub Actions
+│       ├── 002-monitoring-stack.md #     Why Prometheus+Grafana over CloudWatch only
+│       └── 003-vpc-network-design.md #   Why 3-tier VPC with two AZs
 │
-├── docker-compose.yml              # Локальная разработка (app + PG + Prometheus + Grafana)
-├── Makefile                        # Короткие команды (make dev, make test, make deploy)
-├── .env.example                    # Шаблон переменных окружения
+├── docker-compose.yml              # Local dev (app + PG + Prometheus + Grafana)
+├── Makefile                        # Shortcuts (make dev, make test, make deploy)
+├── .env.example                    # Environment variables template
 └── .gitignore
 ```
 
 ---
 
-## Быстрый старт
+## Quick Start
 
-### Локальная разработка
+### Local Development
 
 ```bash
-# 1. Скопировать переменные окружения
+# 1. Copy environment variables
 cp .env.example .env
 
-# 2. Поднять всё одной командой
+# 2. Start everything with one command
 make dev
 
-# 3. Открыть в браузере:
-#    Приложение:   http://localhost:8000
-#    Grafana:      http://localhost:3000  (логин: admin / пароль: admin)
-#    Prometheus:   http://localhost:9090
-#    AlertManager: http://localhost:9093
+# 3. Open in browser:
+#    Application:   http://localhost:8000
+#    Grafana:       http://localhost:3000  (login: admin / password: admin)
+#    Prometheus:    http://localhost:9090
+#    AlertManager:  http://localhost:9093
 
-# 4. Проверить API
+# 4. Test the API
 curl http://localhost:8000/health
 curl http://localhost:8000/api/items
 curl -X POST http://localhost:8000/api/items -H "Content-Type: application/json" -d '{"name":"test"}'
 ```
 
-### Запуск тестов
+### Run Tests
 
 ```bash
 make test    # pytest + coverage
-make lint    # ruff (линтер)
+make lint    # ruff (linter)
 ```
 
-### Деплой на AWS
+### Deploy to AWS
 
-**Что нужно заранее:**
-1. AWS аккаунт с IAM-пользователем (права на EC2, RDS, ECR, ALB, VPC, CloudWatch, SNS, Secrets Manager, S3, DynamoDB)
-2. S3 bucket для Terraform state (`fullstack-deploy-tfstate`)
-3. DynamoDB table для блокировок (`terraform-lock`)
-4. GitLab-репозиторий с настроенными CI/CD Variables
+**Prerequisites:**
+1. AWS account with an IAM user (permissions for EC2, RDS, ECR, ALB, VPC, CloudWatch, SNS, Secrets Manager, S3, DynamoDB)
+2. S3 bucket for Terraform state (`fullstack-deploy-tfstate`)
+3. DynamoDB table for state locking (`terraform-lock`)
+4. GitLab repository with CI/CD Variables configured
 
 ```bash
-# Ручной деплой (без CI/CD):
+# Manual deploy (without CI/CD):
 
-# 1. Посмотреть план изменений
+# 1. Review the plan
 make plan
 
-# 2. Применить инфраструктуру
+# 2. Apply infrastructure
 make apply
 
-# 3. Собрать и запушить Docker-образ в ECR
+# 3. Build and push Docker image to ECR
 make push
 
-# 4. Выкатить приложение (rolling update через ASG)
+# 4. Roll out application (rolling update via ASG)
 make deploy
 
-# 5. Проверить, что всё работает
+# 5. Verify everything works
 make health
 ```
 
-### Настройка GitLab CI/CD Variables
+### GitLab CI/CD Variables
 
-В GitLab: **Settings → CI/CD → Variables** (отметить masked + protected):
+Configure in **Settings → CI/CD → Variables** (mark as masked + protected):
 
-| Переменная | Описание | Пример |
-|-----------|----------|--------|
+| Variable | Description | Example |
+|----------|-------------|---------|
 | `AWS_ACCESS_KEY_ID` | IAM access key | `AKIA...` |
 | `AWS_SECRET_ACCESS_KEY` | IAM secret key (masked) | `wJal...` |
-| `ALERT_EMAIL` | Email для алертов | `alerts@example.com` |
-| `SLACK_WEBHOOK_URL` | Slack webhook (опционально) | `https://hooks.slack.com/...` |
-| `SNS_TOPIC_ARN` | ARN SNS-топика для уведомлений | `arn:aws:sns:eu-north-1:...` |
-| `GITLAB_API_TOKEN` | Для комментариев в MR | `glpat-...` |
+| `ALERT_EMAIL` | Email for alerts | `alerts@example.com` |
+| `SLACK_WEBHOOK_URL` | Slack webhook (optional) | `https://hooks.slack.com/...` |
+| `SNS_TOPIC_ARN` | SNS topic ARN for notifications | `arn:aws:sns:eu-north-1:...` |
+| `GITLAB_API_TOKEN` | For posting MR comments | `glpat-...` |
 
 ---
 
-## Стоимость AWS-ресурсов
+## AWS Resource Costs
 
-| Окружение | Стоимость в месяц | Основные расходы |
-|-----------|-------------------|-----------------|
+| Environment | Monthly Cost | Main Expenses |
+|-------------|-------------|--------------|
 | **Staging** | ~$90 | NAT Gateway ($35), ALB ($18), RDS ($15), EC2 ($8) |
 | **Production** | ~$136 | NAT Gateway ($35), EC2 x2 ($30), RDS ($28), ALB ($18) |
 
-Подробная разбивка: [docs/cost-breakdown.md](docs/cost-breakdown.md)
+Detailed breakdown: [docs/cost-breakdown.md](docs/cost-breakdown.md)
 
 ---
 
-## Полезные команды (Makefile)
+## Makefile Commands
 
-| Команда | Что делает |
-|---------|-----------|
-| `make dev` | Поднять локальное окружение (app + DB + мониторинг) |
-| `make down` | Остановить |
-| `make test` | Запустить тесты |
-| `make lint` | Проверить код линтером |
-| `make build` | Собрать Docker-образ |
+| Command | What it does |
+|---------|-------------|
+| `make dev` | Start local environment (app + DB + monitoring) |
+| `make down` | Stop everything |
+| `make test` | Run tests |
+| `make lint` | Check code with linter |
+| `make build` | Build Docker image |
 | `make plan` | Terraform plan |
 | `make apply` | Terraform apply |
-| `make deploy` | Rolling deploy на AWS |
-| `make rollback` | Откатить на предыдущую версию |
-| `make health` | Проверить здоровье всех компонентов |
-| `make clean` | Удалить все контейнеры, volumes, образы |
+| `make deploy` | Rolling deploy to AWS |
+| `make rollback` | Roll back to previous version |
+| `make health` | Check health of all components |
+| `make clean` | Remove all containers, volumes, images |
 
 ---
 
-## Технологии
+## Tech Stack
 
-| Категория | Технологии |
-|-----------|-----------|
-| **Приложение** | Python 3.12, FastAPI, Uvicorn, psycopg2, prometheus-client |
-| **Тестирование** | pytest, pytest-cov, httpx, ruff |
-| **Контейнеризация** | Docker (multi-stage), Docker Compose |
+| Category | Technologies |
+|----------|-------------|
+| **Application** | Python 3.12, FastAPI, Uvicorn, psycopg2, prometheus-client |
+| **Testing** | pytest, pytest-cov, httpx, ruff |
+| **Containerization** | Docker (multi-stage), Docker Compose |
 | **CI/CD** | GitLab CI/CD (5 stages, 13 jobs), Docker-in-Docker |
-| **Инфраструктура** | Terraform 1.7+ (8 модулей), AWS (EC2, ALB, RDS, ECR, VPC, S3) |
-| **Мониторинг** | Prometheus, Grafana 10, AlertManager, node-exporter |
-| **Логи и алармы** | CloudWatch Logs, CloudWatch Alarms |
-| **Уведомления** | SNS, Lambda (Slack webhook) |
-| **Безопасность** | Secrets Manager, tfsec, Trivy, hadolint, Security Groups |
+| **Infrastructure** | Terraform 1.7+ (8 modules), AWS (EC2, ALB, RDS, ECR, VPC, S3) |
+| **Monitoring** | Prometheus, Grafana 10, AlertManager, node-exporter |
+| **Logs & Alarms** | CloudWatch Logs, CloudWatch Alarms |
+| **Notifications** | SNS, Lambda (Slack webhook) |
+| **Security** | Secrets Manager, tfsec, Trivy, hadolint, Security Groups |
 
 ---
 
-## Документация
+## Documentation
 
-| Документ | Описание |
-|----------|----------|
-| [docs/runbook.md](docs/runbook.md) | Инструкции по эксплуатации: деплой, откат, инциденты, troubleshooting |
-| [docs/cost-breakdown.md](docs/cost-breakdown.md) | Разбивка стоимости AWS-ресурсов для staging и production |
-| [docs/adr/001-gitlab-cicd.md](docs/adr/001-gitlab-cicd.md) | ADR: почему выбран GitLab CI/CD |
-| [docs/adr/002-monitoring-stack.md](docs/adr/002-monitoring-stack.md) | ADR: почему Prometheus + Grafana + CloudWatch |
-| [docs/adr/003-vpc-network-design.md](docs/adr/003-vpc-network-design.md) | ADR: почему 3-tier VPC с двумя AZ |
+| Document | Description |
+|----------|-------------|
+| [docs/runbook.md](docs/runbook.md) | Operations guide: deploy, rollback, incidents, troubleshooting |
+| [docs/cost-breakdown.md](docs/cost-breakdown.md) | AWS resource cost breakdown for staging and production |
+| [docs/adr/001-gitlab-cicd.md](docs/adr/001-gitlab-cicd.md) | ADR: why GitLab CI/CD was chosen |
+| [docs/adr/002-monitoring-stack.md](docs/adr/002-monitoring-stack.md) | ADR: why Prometheus + Grafana + CloudWatch |
+| [docs/adr/003-vpc-network-design.md](docs/adr/003-vpc-network-design.md) | ADR: why 3-tier VPC with two AZs |
 
 ---
 
-## Связанные проекты
+## Related Projects
 
-Этот проект объединяет и развивает три предыдущих:
+This project integrates and builds upon three previous ones:
 
-| # | Проект | Что демонстрирует | Что взято в проект 6 |
-|---|--------|-------------------|---------------------|
-| 3 | [aws-infrastructure-terraform](https://github.com/spaceman5789/aws-infrastructure-terraform) | Terraform-модули (VPC, EC2, RDS) | Модульная структура, Security Groups, remote state |
-| 4 | [gitlab-ci-ec2-deploy](https://github.com/spaceman5789/gitlab-ci-ec2-deploy) | GitLab CI/CD пайплайн | Multi-stage pipeline, Docker build, deploy через SSH |
-| 5 | [multi-service-observability-stack](https://github.com/spaceman5789/multi-service-observability-stack) | Prometheus + Grafana мониторинг | Scrape-конфиги, Grafana dashboards, alert rules |
-| **6** | **Этот проект** | **Всё вместе** | Terraform + GitLab CI/CD + мониторинг + CloudWatch + SNS |
+| # | Project | What it demonstrates | What was taken into project 6 |
+|---|---------|---------------------|------------------------------|
+| 3 | [aws-infrastructure-terraform](https://github.com/spaceman5789/aws-infrastructure-terraform) | Terraform modules (VPC, EC2, RDS) | Modular structure, Security Groups, remote state |
+| 4 | [gitlab-ci-ec2-deploy](https://github.com/spaceman5789/gitlab-ci-ec2-deploy) | GitLab CI/CD pipeline | Multi-stage pipeline, Docker build, deploy via SSH |
+| 5 | [multi-service-observability-stack](https://github.com/spaceman5789/multi-service-observability-stack) | Prometheus + Grafana monitoring | Scrape configs, Grafana dashboards, alert rules |
+| **6** | **This project** | **Everything combined** | Terraform + GitLab CI/CD + monitoring + CloudWatch + SNS |
